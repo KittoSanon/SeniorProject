@@ -171,7 +171,7 @@ class AIClient:
     Minimal HTTP JSON client for chat completion style APIs.
     Supports OpenAI-compatible endpoints (e.g., OpenAI, Azure OpenAI with compat, local servers).
     Environment variables:
-      AI_API_KEY       - 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
+      AI_API_KEY       - secret key
       AI_BASE_URL      - base URL, defaults to https://api.openai.com/v1
       AI_MODEL         - model name, defaults to gpt-4o-mini
     If not configured, the client is disabled and returns None for responses.
