@@ -8,9 +8,6 @@ import json
 from pathlib import Path
 from datetime import datetime
 import os
-import urllib.request
-import urllib.error
-
 
 # ---------- Core components ----------
 
@@ -23,7 +20,6 @@ class ShortTermMemory:
     def add(self, user: str, assistant: str) -> None:
         self.turns.append((user, assistant))
         if len(self.turns) > self.max_turns:
-            # Keep only the most recent max_turns
             self.turns = self.turns[-self.max_turns :]
 
     def clear(self) -> None:
@@ -54,10 +50,7 @@ class SafeCalculator:
     }
 
     def try_calculate(self, text: str) -> Optional[float]:
-        """
-        Try to parse and evaluate an arithmetic expression from the entire text.
-        Returns a float/int on success, or None if the text isn't a pure expression.
-        """
+        """Return numeric result if `text` is a pure arithmetic expression; else None."""
         try:
             node = ast.parse(text.strip(), mode="eval")
         except SyntaxError:
@@ -80,22 +73,20 @@ class SafeCalculator:
             return node.n
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return node.value
-        # Disallow everything else (names, calls, etc.)
         raise ValueError("Unsupported expression")
 
 
 def process_input(user_text: str, memory: ShortTermMemory, calculator: SafeCalculator) -> str:
     """
-    Conversational processor:
-    - First, attempt to evaluate if the input is a pure arithmetic expression.
-    - Otherwise, provide a simple conversational response using short-term memory context.
+    Conversational processor when AI is off/unavailable.
     """
-    # 1) Try calculation
     calc_result = calculator.try_calculate(user_text)
     if calc_result is not None:
+        # แสดงเป็น int ถ้าลงตัว
+        if isinstance(calc_result, float) and calc_result.is_integer():
+            calc_result = int(calc_result)
         return f"The result is {calc_result}"
 
-    # 2) Simple conversational echo with context length
     memory_size = len(memory.turns)
     if user_text.strip().endswith("?"):
         return f"You asked a question. I currently remember {memory_size} turn(s)."
@@ -124,7 +115,6 @@ class UserRegistry:
     Persistent user registry backed by a small JSON file in the project directory.
     Keys are lowercase names; values are user profile dicts.
     """
-
     def __init__(self, path: Path) -> None:
         self.path = path
         self._users = self._load()
@@ -164,84 +154,105 @@ class UserRegistry:
         return profile
 
 
-# ---------- AI provider (optional) ----------
+# ---------- Gemini provider ----------
 
-class AIClient:
+class GeminiClient:
     """
-    Minimal HTTP JSON client for chat completion style APIs.
-    Supports OpenAI-compatible endpoints (e.g., OpenAI, Azure OpenAI with compat, local servers).
-    Environment variables:
-      AI_API_KEY       - secret key
-      AI_BASE_URL      - base URL, defaults to https://api.openai.com/v1
-      AI_MODEL         - model name, defaults to gpt-4o-mini
-    If not configured, the client is disabled and returns None for responses.
+    Minimal Gemini client using google-generativeai (AI Studio).
+    Env:
+      GEMINI_API_KEY  - required
+      GEMINI_MODEL    - default 'gemini-1.5-flash' (or 'gemini-1.5-pro', etc.)
     """
-
     def __init__(self) -> None:
-        self.api_key = os.getenv("AI_API_KEY", "").strip()
-        self.base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        self.model = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
+        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+        self._model = None
+
+        try:
+            import google.generativeai as genai  # type: ignore
+            self._genai = genai
+            if self.api_key:
+                self._genai.configure(api_key=self.api_key)
+        except Exception:
+            self._genai = None  # library not installed or other error
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key and self.model and self.base_url)
+        return bool(self.api_key and self._genai is not None)
 
     def set_model(self, model: str) -> None:
         if model.strip():
-            self.model = model.strip()
+            self.model_name = model.strip()
+            self._model = None  # re-init next call
+
+    def _ensure_model(self, system_prompt: str):
+        if not self.enabled:
+            return None
+        if self._model is None:
+            # system_instruction จะถูกแนบเข้าไปที่ระดับโมเดล
+            self._model = self._genai.GenerativeModel(
+                model_name=self.model_name,
+                system_instruction=system_prompt,
+            )
+        return self._model
 
     def chat(self, system_prompt: str, messages: List[Tuple[str, str]]) -> Optional[str]:
         """
-        messages: list of (role, content), role in {'system','user','assistant'}
-        Returns assistant message string on success, else None.
+        messages: list of (role, content) with role in {'system','user','assistant'}.
+        We pass system prompt via system_instruction; rest go as contents.
         """
         if not self.enabled:
             return None
 
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system_prompt}]
-            + [{"role": r, "content": c} for r, c in messages],
-            "temperature": 0.7,
-        }
-        data = json.dumps(payload).encode("utf-8")
-        url = f"{self.base_url}/chat/completions"
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", f"Bearer {self.api_key}")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                doc = json.loads(raw.decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+        model = self._ensure_model(system_prompt)
+        if model is None:
             return None
 
-        # OpenAI-compatible shape
+        # แปลงเป็น contents ตามสไตล์ Gemini
+        contents = []
+        for role, content in messages:
+            if role == "system":
+                # ข้าม เพราะใช้ system_instruction แล้ว
+                continue
+            r = "user" if role == "user" else "model"
+            contents.append({"role": r, "parts": [content]})
+
         try:
-            return doc["choices"][0]["message"]["content"]
+            resp = model.generate_content(
+                contents,
+                generation_config={"temperature": 0.7},
+            )
+            text = getattr(resp, "text", None)
+            if text:
+                return text
+            # เผื่อบางรุ่นคืนรูปแบบอื่น
+            if hasattr(resp, "candidates") and resp.candidates:
+                parts = resp.candidates[0].content.parts
+                return "".join(getattr(p, "text", "") for p in parts)
         except Exception:
             return None
+        return None
 
+
+# ---------- App loop ----------
 
 def main() -> None:
     """
-    Minimal conversational loop with memory and calculator.
+    Minimal conversational loop with memory, calculator, and Gemini.
     Commands:
-      /help  - show help
-      /mem   - show recent memory
-      /clear - clear memory
-      /ai    - toggle AI provider on/off (if configured)
-      /model <name> - set AI model name
-      exit   - quit
+      /help        - show help
+      /mem         - show recent memory
+      /clear       - clear memory
+      /ai          - toggle Gemini on/off (if configured)
+      /model <name>- set Gemini model name
+      exit         - quit
     """
-    # Initialize services
     memory = ShortTermMemory()
     calculator = SafeCalculator()
     registry = UserRegistry(path=Path(__file__).with_name("users.json"))
-    ai = AIClient()
+    ai = GeminiClient()
     ai_enabled = ai.enabled
 
-    # Onboarding and recognition
     print("Welcome. Before we chat, what's your name?")
     while True:
         try:
@@ -262,7 +273,8 @@ def main() -> None:
     print("Main system ready. Type your text and press Enter. Type 'exit' to quit.")
     print("Commands: /help, /mem, /clear, /ai, /model <name>")
     if not ai_enabled:
-        print("AI provider not configured. Set AI_API_KEY (and optionally AI_BASE_URL, AI_MODEL).")
+        print("Gemini not configured. Set GEMINI_API_KEY (and optionally GEMINI_MODEL).")
+
     while True:
         try:
             user_text = input("Instruction> ")
@@ -289,19 +301,22 @@ def main() -> None:
             print("Memory cleared.")
             continue
         if cmd == "/ai":
-            ai_enabled = not ai_enabled and ai.enabled
-            print(f"AI is now {'ON' if ai_enabled else 'OFF'}.")
+            if not ai.enabled:
+                print("Gemini is not configured. Set GEMINI_API_KEY first.")
+            else:
+                ai_enabled = not ai_enabled
+                print(f"AI is now {'ON' if ai_enabled else 'OFF'}.")
             continue
         if cmd.startswith("/model "):
             _, _, model_name = user_text.partition(" ")
             if model_name.strip():
                 ai.set_model(model_name.strip())
-                print(f"Model set to: {ai.model}")
+                print(f"Model set to: {ai.model_name}")
             else:
                 print("Usage: /model <name>")
             continue
 
-        # If AI is enabled, construct a context and get AI response first
+        # If AI is enabled, build context and ask Gemini first
         result: Optional[str] = None
         if ai_enabled:
             system_prompt = (
@@ -309,17 +324,16 @@ def main() -> None:
                 "Be concise, reference short-term memory if relevant, and solve basic problems."
             )
             history: List[Tuple[str, str]] = []
-            # include up to last 6 turns for context
             for u, a in memory.turns[-6:]:
                 history.append(("user", u))
                 history.append(("assistant", a))
-            # add current user message with name prefix
             history.append(("user", f"{profile.name}: {user_text}"))
+
             ai_reply = ai.chat(system_prompt, history)
             if ai_reply:
                 result = ai_reply
 
-        # Fallback to local processor if AI disabled or failed
+        # Fallback to local processor
         if result is None:
             result = process_input(user_text, memory, calculator)
 
@@ -329,5 +343,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
