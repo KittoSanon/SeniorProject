@@ -10,204 +10,14 @@ from datetime import datetime, timezone
 import json
 import os
 
-# Load .env if available
+# ---------- Load .env if available ----------
+
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).with_name(".env"), override=False)
     load_dotenv(override=False)
 except ImportError:
     pass
-
-# ---------- Core components ----------
-
-class ShortTermMemory:
-    """In-memory buffer using deque for O(1) operations."""
-    def __init__(self, max_turns: int = 20):
-        self.max_turns = max_turns
-        self.turns: deque[tuple[str, str]] = deque(maxlen=max_turns)
-
-    def add(self, user: str, assistant: str) -> None:
-        self.turns.append((user, assistant))
-
-    def clear(self) -> None:
-        self.turns.clear()
-
-    def get_history(self, window: int) -> list[tuple[str, str]]:
-        return list(self.turns)[-window:]
-
-    def summary(self) -> str:
-        return "\n".join(f"U: {u}\nA: {a}" for u, a in self.turns) or "(empty)"
-
-
-class SafeCalculator:
-    """Safe arithmetic expression evaluator."""
-    _ops = {
-        ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-        ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
-        ast.Mod: operator.mod, ast.Pow: operator.pow,
-        ast.USub: operator.neg, ast.UAdd: operator.pos,
-    }
-
-    def try_calculate(self, text: str) -> Optional[float]:
-        try:
-            node = ast.parse(text.strip(), mode="eval")
-            return self._eval(node.body)
-        except Exception:
-            return None
-
-    def _eval(self, node) -> float:
-        if isinstance(node, ast.BinOp) and type(node.op) in self._ops:
-            return self._ops[type(node.op)](self._eval(node.left), self._eval(node.right))
-        if isinstance(node, ast.UnaryOp) and type(node.op) in self._ops:
-            return self._ops[type(node.op)](self._eval(node.operand))
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return node.value
-        if isinstance(node, ast.Num):  # Python <3.8
-            return node.n
-        raise ValueError("Unsupported")
-
-
-def short_answer_local(text: str) -> Optional[str]:
-    """Fast local answers for simple queries."""
-    t = text.strip().lower()
-    if not t:
-        return None
-    
-    now = datetime.now()
-    if "day" in t and ("what" in t or "which" in t or "today" in t):
-        return f"today is {now.strftime('%A').lower()}!"
-    if "date" in t and ("what" in t or "today" in t):
-        return f"today is {now.strftime('%Y-%m-%d').lower()}."
-    if "time" in t and ("what" in t or "now" in t or "current" in t):
-        return f"the time is {now.strftime('%H:%M').lower()}."
-    if "month" in t and ("what" in t or "today" in t):
-        return f"it is {now.strftime('%B').lower()}."
-    if "year" in t and ("what" in t or "now" in t):
-        return f"it is {now.strftime('%Y').lower()}."
-    return None
-
-
-class TTS:
-    """Lazy-loaded text-to-speech using pyttsx3."""
-    def __init__(self):
-        self._engine = None
-        self._pyttsx3 = None
-        try:
-            import pyttsx3
-            self._pyttsx3 = pyttsx3
-        except ImportError:
-            pass
-
-    @property
-    def available(self) -> bool:
-        return self._pyttsx3 is not None
-
-    def _get_engine(self):
-        if self._engine is None and self._pyttsx3:
-            try:
-                self._engine = self._pyttsx3.init()
-                try:
-                    rate = self._engine.getProperty("rate")
-                    if isinstance(rate, (int, float)):
-                        self._engine.setProperty("rate", int(rate * 1.1))
-                except Exception:
-                    pass
-            except Exception:
-                self._engine = None
-        return self._engine
-
-    def speak(self, text: str) -> bool:
-        if not text.strip():
-            return False
-        engine = self._get_engine()
-        if not engine:
-            return False
-        trimmed = text.strip()
-        if len(trimmed) > 220:
-            trimmed = trimmed[:217].rsplit(" ", 1)[0] + "..."
-        try:
-            engine.stop()
-            engine.say(trimmed)
-            engine.runAndWait()
-            return True
-        except Exception:
-            self._engine = None
-            return False
-
-
-def process_input(user_text: str, memory: ShortTermMemory, calculator: SafeCalculator) -> str:
-    """Fallback processor when AI is unavailable."""
-    result = calculator.try_calculate(user_text)
-    if result is not None:
-        return f"The result is {int(result) if result.is_integer() else result}"
-    count = len(memory.turns)
-    if user_text.strip().endswith("?"):
-        return f"You asked a question. I remember {count} turn(s)."
-    return f"I hear you: '{user_text.strip()}'. I remember {count} turn(s)."
-
-
-# ---------- User recognition ----------
-
-@dataclass
-class UserProfile:
-    name: str
-    created_at_iso: str
-    last_seen_iso: str
-
-    @staticmethod
-    def new(name: str) -> "UserProfile":
-        now = datetime.now(timezone.utc).isoformat()
-        return UserProfile(name, now, now)
-
-    def touch(self) -> None:
-        self.last_seen_iso = datetime.now(timezone.utc).isoformat()
-
-
-class UserRegistry:
-    """Persistent user registry with optimized I/O."""
-    def __init__(self, path: Path):
-        self.path = path
-        self._users: dict[str, dict] = self._load()
-        self._dirty = False
-
-    def _load(self) -> dict[str, dict]:
-        if not self.path.exists():
-            return {}
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def _save(self) -> None:
-        if not self._dirty:
-            return
-        try:
-            tmp = self.path.with_suffix(".tmp")
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(self._users, f, indent=2)
-            tmp.replace(self.path)
-            self._dirty = False
-        except Exception:
-            pass
-
-    def get_or_create(self, name: str) -> UserProfile:
-        key = name.strip().lower()
-        if not key:
-            raise ValueError("User name cannot be empty")
-        raw = self._users.get(key)
-        if raw is None:
-            profile = UserProfile.new(name.strip())
-            self._users[key] = asdict(profile)
-            self._dirty = True
-        else:
-            profile = UserProfile(**raw)
-            profile.touch()
-            self._users[key] = asdict(profile)
-            self._dirty = True
-        self._save()
-        return profile
 
 
 # ---------- Gemini provider ----------
@@ -313,207 +123,102 @@ class GeminiClient:
         return None
 
 
-# ---------- App loop ----------
+# ---------- Short-term memory ----------
 
-def _build_system_prompt(name: str, tone: str, brief: bool) -> str:
-    """Build cached system prompt."""
-    parts = [
-        "You are a warm, human-like assistant.",
-        f"Adopt a {tone} tone with natural, conversational phrasing and contractions.",
-        f"The user's name is {name}. Avoid repeating the name unless greeting them explicitly or it is contextually necessary.",
-        "Be concise but helpful. Use plain language and avoid sounding robotic.",
-        "Reference the short-term memory if relevant to keep continuity.",
-        "When appropriate, end with a brief, friendly follow-up question to keep the flow.",
-        "Do not overuse emojis; use them sparingly only if tone is playful.",
-    ]
-    if brief:
-        parts.extend([
-            "Keep responses short and crystal-clear. Aim for 1–2 concise sentences.",
-            "Prefer plain text answers without preamble. Avoid repeating the question.",
-        ])
-    if tone == "playful":
-        parts.append("Allow light humor and the occasional emoji when it makes sense.")
-    elif tone == "professional":
-        parts.append("Keep a clear, calm, and respectful tone without slang.")
-    return " ".join(parts)
+class ShortTermMemory:
+    """In-memory buffer using deque for O(1) operations."""
+    def __init__(self, max_turns: int = 20):
+        self.max_turns = max_turns
+        self.turns: deque[tuple[str, str]] = deque(maxlen=max_turns)
+
+    def add(self, user: str, assistant: str) -> None:
+        self.turns.append((user, assistant))
+
+    def clear(self) -> None:
+        self.turns.clear()
+
+    def get_history(self, window: int) -> list[tuple[str, str]]:
+        return list(self.turns)[-window:]
+
+    def summary(self) -> str:
+        return "\n".join(f"U: {u}\nA: {a}" for u, a in self.turns) or "(empty)"
 
 
-def main() -> None:
-    """Optimized conversational loop with command dispatcher."""
-    memory = ShortTermMemory()
-    calculator = SafeCalculator()
-    registry = UserRegistry(Path(__file__).with_name("users.json"))
-    ai = GeminiClient()
-    tts = TTS()
+# ---------- Input processor ----------
+class InputProcessor:
+    """Input processor that receives input, processes with GeminiClient, and outputs results."""
+    def __init__(self):
+        self.gemini_client = GeminiClient()
+        self.memory = ShortTermMemory()
+        self.tts = TTS()
+        self.tone = "friendly"
+        self.brief_mode = True
+        self._cached_prompt = None
+        self._cached_prompt_key = None
     
-    # State
-    ai_enabled = ai.enabled
-    speech_enabled = tts.available
-    tone = "friendly"
-    fast_mode = False
-    fast_mode_prev_tokens = ai.max_output_tokens
-    brief_mode = True
-    short_mode = True
-
-    # Get user name
-    print("Welcome. Before we chat, what's your name?")
-    while True:
+    def input(self, prompt: str = "Instruction> ") -> Optional[str]:
+        """Receive input from user."""
         try:
-            if name := input("Name> ").strip():
-                break
-            print("Please enter a non-empty name.")
+            user_input = input(prompt).strip()
+            return user_input if user_input else None
         except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
-            return
+            return None
+    
+    def processor(self, user_text: str, user_name: str = "User") -> Optional[str]:
+        """Process user input using GeminiClient."""
+        if not self.gemini_client.enabled:
+            return None
+        
+        # Build system prompt
+        prompt_key = (user_name, self.tone, self.brief_mode)
+        if self._cached_prompt_key != prompt_key:
+            self._cached_prompt = self._build_system_prompt(user_name, self.tone, self.brief_mode)
+            self._cached_prompt_key = prompt_key
+        
+        # Build conversation history
+        history = []
+        for u, a in self.memory.get_history(6):
+            history.append(("user", u))
+            history.append(("assistant", a))
+        history.append(("user", user_text))
+        
+        # Process with Gemini
+        result = self.gemini_client.chat(self._cached_prompt, history)
+        if not result and self.gemini_client.last_error:
+            return f"[AI Error] {self.gemini_client.last_error}"
+        
+        return result
+    
+    def output(self, result: str, use_speech: bool = False) -> None:
+        """Output result to user."""
+        if result:
+            print(f"Result OUTPUT: {result}")
+            if use_speech and self.tts.available:
+                self.tts.speak(result)
+    
+    def add_to_memory(self, user_text: str, assistant_text: str) -> None:
+        """Add conversation turn to memory."""
+        self.memory.add(user_text, assistant_text)
+    
+    def _build_system_prompt(self, name: str, tone: str, brief: bool) -> str:
+        """Build cached system prompt."""
+        parts = [
+            "You are a warm, human-like assistant.",
+            f"Adopt a {tone} tone with natural, conversational phrasing and contractions.",
+            f"The user's name is {name}. Avoid repeating the name unless greeting them explicitly or it is contextually necessary.",
+            "Be concise but helpful. Use plain language and avoid sounding robotic.",
+            "Reference the short-term memory if relevant to keep continuity.",
+            "When appropriate, end with a brief, friendly follow-up question to keep the flow.",
+            "Do not overuse emojis; use them sparingly only if tone is playful.",
+        ]
+        if brief:
+            parts.extend([
+                "Keep responses short and crystal-clear. Aim for 1–2 concise sentences.",
+                "Prefer plain text answers without preamble. Avoid repeating the question.",
+            ])
+        if tone == "playful":
+            parts.append("Allow light humor and the occasional emoji when it makes sense.")
+        elif tone == "professional":
+            parts.append("Keep a clear, calm, and respectful tone without slang.")
+        return " ".join(parts)
 
-    profile = registry.get_or_create(name)
-    print(f"{'Nice to meet you' if profile.created_at_iso == profile.last_seen_iso else 'Welcome back'}, {profile.name}!")
-    print("Main system ready. Type 'exit' to quit or '/help' for commands.")
-    if not ai_enabled:
-        print("Gemini not configured. Set GEMINI_API_KEY.")
-
-    # Main loop
-    cached_prompt = None
-    cached_prompt_key = None
-    while True:
-        try:
-            user_text = input("Instruction> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
-            break
-
-        if not user_text:
-            continue
-        if user_text.lower() == "exit":
-            print("Goodbye.")
-            break
-
-        cmd_parts = user_text.split(None, 1)
-        cmd = cmd_parts[0].lower()
-        arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
-
-        # Handle commands
-        if cmd == "/help":
-            print("Commands: /mem, /clear, /ai, /model <name>, /models, /fast, /brief, /short,")
-            print("/speak, /temp <0-1>, /tone <friendly|professional|playful>, /status, /debug, exit")
-            continue
-        elif cmd == "/mem":
-            print("Memory:\n" + memory.summary())
-            continue
-        elif cmd == "/clear":
-            memory.clear()
-            print("Memory cleared.")
-            continue
-        elif cmd == "/ai":
-            if not ai.enabled:
-                print("AI not configured.")
-            else:
-                ai_enabled = not ai_enabled
-                print(f"AI: {'ON' if ai_enabled else 'OFF'}")
-            continue
-        elif cmd == "/temp":
-            try:
-                ai.set_temperature(float(arg))
-                print(f"Temperature: {ai.temperature}")
-            except ValueError:
-                print("Usage: /temp <0-1>")
-            continue
-        elif cmd == "/tone":
-            if arg.lower() in {"friendly", "professional", "playful"}:
-                tone = arg.lower()
-                cached_prompt = None
-                cached_prompt_key = None
-                print(f"Tone: {tone}")
-            else:
-                print("Usage: /tone <friendly|professional|playful>")
-            continue
-        elif cmd == "/model":
-            if arg:
-                ai.set_model(arg)
-                print(f"Model: {ai.model_name}")
-            else:
-                print("Usage: /model <name>")
-            continue
-        elif cmd == "/models":
-            if not ai.enabled:
-                print("AI not configured.")
-            else:
-                models = [name for name, supports in ai.list_models() if supports]
-                if models:
-                    print("Available models:")
-                    for m in models:
-                        print(f"  - {m}")
-                else:
-                    print("No models found." + (f" Error: {ai.last_error}" if ai.last_error else ""))
-            continue
-        elif cmd == "/fast":
-            fast_mode = not fast_mode
-            if fast_mode:
-                fast_mode_prev_tokens = ai.max_output_tokens
-                ai.set_max_output_tokens(min(ai.max_output_tokens, 256))
-            else:
-                ai.set_max_output_tokens(fast_mode_prev_tokens)
-            print(f"Fast mode: {'ON' if fast_mode else 'OFF'}")
-            continue
-        elif cmd == "/brief":
-            brief_mode = not brief_mode
-            cached_prompt = None
-            cached_prompt_key = None
-            print(f"Brief mode: {'ON' if brief_mode else 'OFF'}")
-            continue
-        elif cmd == "/short":
-            short_mode = not short_mode
-            print(f"Short mode: {'ON' if short_mode else 'OFF'}")
-            continue
-        elif cmd == "/speak":
-            if not tts.available:
-                print("TTS not available. Install 'pyttsx3'.")
-            else:
-                speech_enabled = not speech_enabled
-                print(f"Speech: {'ON' if speech_enabled else 'OFF'}")
-            continue
-        elif cmd == "/status":
-            print(f"AI: {'ON' if ai_enabled else 'OFF'} ({'configured' if ai.enabled else 'not configured'})")
-            print(f"Model: {ai.model_name}, Temp: {ai.temperature}, Tokens: {ai.max_output_tokens}")
-            print(f"Fast: {fast_mode}, Brief: {brief_mode}, Short: {short_mode}, Speech: {speech_enabled}")
-            continue
-        elif cmd == "/debug":
-            print(f"API Key: {'set' if ai.api_key else 'not set'}")
-            print(f"GenAI lib: {'installed' if ai._genai else 'not installed'}")
-            print(f"AI enabled: {ai.enabled}, Last error: {ai.last_error or 'none'}")
-            continue
-
-        # Process user input
-        result = None
-        if short_mode and (result := short_answer_local(user_text)):
-            pass
-        elif ai_enabled:
-            # Cache system prompt
-            prompt_key = (profile.name, tone, brief_mode)
-            if cached_prompt_key != prompt_key:
-                cached_prompt = _build_system_prompt(profile.name, tone, brief_mode)
-                cached_prompt_key = prompt_key
-            
-            # Build history
-            window = 2 if fast_mode else 6
-            history = []
-            for u, a in memory.get_history(window):
-                history.append(("user", u))
-                history.append(("assistant", a))
-            history.append(("user", user_text))
-            
-            result = ai.chat(cached_prompt, history)
-            if not result and ai.last_error:
-                print(f"[AI] {ai.last_error}")
-
-        if not result:
-            result = process_input(user_text, memory, calculator)
-
-        print(f"Result OUTPUT: {result}")
-        if speech_enabled:
-            tts.speak(result)
-        memory.add(user_text, result)
-
-
-if __name__ == "__main__":
-    main()
