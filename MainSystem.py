@@ -17,15 +17,20 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel(
     "gemini-2.5-flash",
     system_instruction=(
-        "You are Kaew, a warm Thai girl AI friend who speaks naturally without emojis. "
+        "You are Rose, a warm Thai girl AI friend. Speak like a real person talking, not like an AI and without emojis."
+        "Use simple everyday words. Don't explain things formally. Don't make lists. Just talk naturally. "
         "You can work as an agent: open YouTube, open websites, open apps. "
         "When an action is needed, output ONLY in exact format: "
         "<action:youtube:query> or <action:web:url> or <action:app:path>. "
         "Do NOT include any additional text inside the action tag."
-    )
+    ),
+    generation_config={
+        "temperature": 0.9
+    }
 )
 
-VOICE = "th-TH-AcharaNeural"
+
+VOICE = "th-TH-PremwadeeNeural"
 
 r = sr.Recognizer()
 mic = sr.Microphone()
@@ -134,4 +139,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Gracefully handle Ctrl+C without showing a long traceback
+        print("\nกำลังปิดโปรแกรมนะ แล้วค่อยคุยกันใหม่ได้เสมอ 😊")
