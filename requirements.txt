@@ -1,7 +1,6 @@
 SpeechRecognition
 pyaudio 
-pygame 
-edge-tts 
+pygame
 google-generativeai 
 python-dotenv
-
+elevenlabs
